@@ -1,28 +1,23 @@
 {
-  "name": "trading-exchange",
-  "version": "0.1.0",
+  "name": "trading-exchange-monorepo",
+  "version": "1.0.0",
   "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
   "scripts": {
-    "dev": "next dev",
-    "build": "next build",
-    "start": "next start",
-    "lint": "next lint"
-  },
-  "dependencies": {
-    "framer-motion": "^12.40.0",
-    "lucide-react": "^1.18.0",
-    "next": "14.2.35",
-    "react": "^18",
-    "react-dom": "^18"
+    "dev:web": "npm run dev -w apps/web",
+    "dev:engine": "npm run dev -w apps/engine",
+    "build:web": "npm run build -w apps/web",
+    "build:engine": "npm run build -w apps/engine",
+    "lint": "npm run lint --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present"
   },
   "devDependencies": {
-    "@types/node": "^20",
-    "@types/react": "^18",
-    "@types/react-dom": "^18",
-    "eslint": "^8",
-    "eslint-config-next": "14.2.35",
-    "postcss": "^8",
-    "tailwindcss": "^3.4.1",
-    "typescript": "^5"
+    "typescript": "^5.0.0",
+    "prettier": "^3.0.0",
+    "eslint": "^8.0.0"
   }
 }

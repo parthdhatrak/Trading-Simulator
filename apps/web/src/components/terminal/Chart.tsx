@@ -1,11 +1,29 @@
 "use client";
 
-import React, { useState, useEffect, useMemo, useRef, useCallback } from "react";
+import React, {
+  useState,
+  useEffect,
+  useRef,
+  useCallback,
+} from "react";
+import {
+  createChart,
+  CrosshairMode,
+  CandlestickSeries,
+  HistogramSeries,
+  type IChartApi,
+  type ISeriesApi,
+  type CandlestickData,
+  type HistogramData,
+  type UTCTimestamp,
+} from "lightweight-charts";
 import { useTradingStore } from "@/lib/tradingStore";
 import { TrendingUp, RefreshCw } from "lucide-react";
 
+/* ─── Types ──────────────────────────────────────────────────────────────── */
+
 interface Candle {
-  time: number;
+  time: number; // Unix ms (our internal format)
   open: number;
   high: number;
   low: number;
@@ -21,25 +39,184 @@ interface MarketMeta {
   marketState?: string;
 }
 
+/* ─── Helpers ────────────────────────────────────────────────────────────── */
+
+/** Convert ms → seconds expected by lightweight-charts */
+const toSec = (ms: number): UTCTimestamp =>
+  Math.floor(ms / 1000) as UTCTimestamp;
+
+/** Deduplicate + sort candles by time ascending (required by the library) */
+const dedupeSort = (candles: Candle[]): Candle[] => {
+  const map = new Map<number, Candle>();
+  for (const c of candles) map.set(toSec(c.time), c); // later entry wins
+  return [...map.values()].sort((a, b) => toSec(a.time) - toSec(b.time));
+};
+
+/* ─── TradingView-identical chart colours ────────────────────────────────── */
+
+const TV_UP = "#26a69a";
+const TV_DOWN = "#ef5350";
+const TV_UP_ALPHA = "rgba(38,166,154,0.35)";
+const TV_DOWN_ALPHA = "rgba(239,83,80,0.35)";
+
+/* ─── Component ──────────────────────────────────────────────────────────── */
+
 export default function Chart() {
   const trades = useTradingStore((s) => s.trades);
   const activeSymbol = useTradingStore((s) => s.activeSymbol);
 
+  /* DOM ref for the chart canvas container */
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  /* lightweight-charts API handles */
+  const chartRef = useRef<IChartApi | null>(null);
+  const candleSeriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
+  const volumeSeriesRef = useRef<ISeriesApi<"Histogram"> | null>(null);
+
+  /* React state — only used for the header overlay, not for rendering candles */
   const [candles, setCandles] = useState<Candle[]>([]);
   const [meta, setMeta] = useState<MarketMeta | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [hoveredCandle, setHoveredCandle] = useState<Candle | null>(null);
 
-  const lastProcessedTradeId = useRef<string | null>(null);
+  const lastTradeId = useRef<string | null>(null);
 
-  // ── Fetch real Yahoo Finance candles ──────────────────────────────────────
+  /* ── 1. Create chart once on mount ──────────────────────────────────────── */
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+
+    const chart = createChart(el, {
+      autoSize: true,
+      layout: {
+        background: { color: "transparent" },
+        textColor: "#94a3b8",
+        fontFamily:
+          "'JetBrains Mono', 'Cascadia Code', 'Fira Mono', monospace",
+        fontSize: 11,
+      },
+      grid: {
+        vertLines: { color: "rgba(51,65,85,0.45)" },
+        horzLines: { color: "rgba(51,65,85,0.45)" },
+      },
+      crosshair: {
+        mode: CrosshairMode.Normal,
+        vertLine: {
+          color: "rgba(148,163,184,0.4)",
+          style: 2,
+          labelBackgroundColor: "#1e293b",
+        },
+        horzLine: {
+          color: "rgba(148,163,184,0.4)",
+          style: 2,
+          labelBackgroundColor: "#1e293b",
+        },
+      },
+      rightPriceScale: {
+        borderColor: "rgba(51,65,85,0.6)",
+        textColor: "#64748b",
+        scaleMargins: { top: 0.08, bottom: 0.25 },
+      },
+      timeScale: {
+        borderColor: "rgba(51,65,85,0.6)",
+        timeVisible: true,
+        secondsVisible: false,
+        rightOffset: 6,
+        barSpacing: 8,
+        minBarSpacing: 2,
+        fixLeftEdge: false,
+        fixRightEdge: false,
+      },
+    });
+
+    /* Candlestick series */
+    const candleSeries = chart.addSeries(CandlestickSeries, {
+      upColor: TV_UP,
+      downColor: TV_DOWN,
+      borderVisible: false,
+      wickUpColor: TV_UP,
+      wickDownColor: TV_DOWN,
+    });
+
+    /* Volume histogram — overlaid on same pane, bottom 20% */
+    const volumeSeries = chart.addSeries(HistogramSeries, {
+      color: TV_UP_ALPHA,
+      priceFormat: { type: "volume" },
+      priceScaleId: "vol",
+    });
+    chart.priceScale("vol").applyOptions({
+      scaleMargins: { top: 0.8, bottom: 0 },
+    });
+
+    /* Crosshair move → update header OHLCV */
+    chart.subscribeCrosshairMove((param) => {
+      if (!param.time || !param.point) {
+        setHoveredCandle(null);
+        return;
+      }
+      const bar = param.seriesData.get(candleSeries) as
+        | CandlestickData
+        | undefined;
+      if (bar) {
+        setHoveredCandle({
+          time: (bar.time as number) * 1000,
+          open: bar.open,
+          high: bar.high,
+          low: bar.low,
+          close: bar.close,
+          volume: 0,
+        });
+      }
+    });
+
+    chartRef.current = chart;
+    candleSeriesRef.current = candleSeries;
+    volumeSeriesRef.current = volumeSeries;
+
+    return () => {
+      chart.remove();
+      chartRef.current = null;
+      candleSeriesRef.current = null;
+      volumeSeriesRef.current = null;
+    };
+  }, []);
+
+  /* ── 2. Push candle state into the series whenever it changes ───────────── */
+  useEffect(() => {
+    const cSeries = candleSeriesRef.current;
+    const vSeries = volumeSeriesRef.current;
+    if (!cSeries || !vSeries || candles.length === 0) return;
+
+    const sorted = dedupeSort(candles);
+
+    const tvCandles: CandlestickData[] = sorted.map((c) => ({
+      time: toSec(c.time),
+      open: c.open,
+      high: c.high,
+      low: c.low,
+      close: c.close,
+    }));
+
+    const tvVolume: HistogramData[] = sorted.map((c) => ({
+      time: toSec(c.time),
+      value: c.volume,
+      color: c.close >= c.open ? TV_UP_ALPHA : TV_DOWN_ALPHA,
+    }));
+
+    cSeries.setData(tvCandles);
+    vSeries.setData(tvVolume);
+    chartRef.current?.timeScale().fitContent();
+  }, [candles]);
+
+  /* ── 3. Fetch Yahoo Finance candles on symbol change ────────────────────── */
   const fetchCandles = useCallback(async (symbol: string) => {
     setLoading(true);
     setError(null);
+    setHoveredCandle(null);
     try {
       const res = await fetch(`/api/yahoo-finance?symbol=${symbol}`);
       const data = await res.json();
-
       if (!res.ok || data.error) {
         setError(data.error ?? `Error fetching data for ${symbol}`);
         setCandles([]);
@@ -48,127 +225,83 @@ export default function Chart() {
         setMeta(data.meta ?? null);
       }
     } catch {
-      setError("Network error: Could not reach Yahoo Finance proxy.");
+      setError("Network error — could not reach Yahoo Finance proxy.");
     } finally {
       setLoading(false);
     }
   }, []);
 
-  // Fetch on mount and on symbol switch
   useEffect(() => {
     fetchCandles(activeSymbol);
-    lastProcessedTradeId.current = null;
+    lastTradeId.current = null;
   }, [activeSymbol, fetchCandles]);
 
-  // ── Aggregate live Socket.io trades on top of real chart history ──────────
+  /* ── 4. Aggregate live Socket.io trades on top of history ───────────────── */
   useEffect(() => {
     if (trades.length === 0) return;
-    const latestTrade = trades[0];
-
-    if (latestTrade.id === lastProcessedTradeId.current) return;
-    lastProcessedTradeId.current = latestTrade.id;
+    const latest = trades[0];
+    if (latest.id === lastTradeId.current) return;
+    lastTradeId.current = latest.id;
 
     setCandles((prev) => {
       if (prev.length === 0) return prev;
-
       const updated = [...prev];
-      const lastCandle = updated[updated.length - 1];
-      const tradePrice = latestTrade.price;
-      const tradeQty = latestTrade.quantity;
-      const tradeTime = latestTrade.timestamp;
+      const last = updated[updated.length - 1];
+      const { price, quantity, timestamp } = latest;
 
-      // Aggregate into the same 1-minute bucket as the chart resolution
-      const isSameBucket = tradeTime - lastCandle.time < 60_000;
+      if (timestamp - last.time < 60_000) {
+        // Same 1-min bucket → update last candle
+        last.high = Math.max(last.high, price);
+        last.low = Math.min(last.low, price);
+        last.close = price;
+        last.volume += quantity;
 
-      if (isSameBucket) {
-        lastCandle.high = Number(Math.max(lastCandle.high, tradePrice).toFixed(2));
-        lastCandle.low = Number(Math.min(lastCandle.low, tradePrice).toFixed(2));
-        lastCandle.close = Number(tradePrice.toFixed(2));
-        lastCandle.volume += tradeQty;
+        // Push incremental update directly into the series (no full re-render)
+        candleSeriesRef.current?.update({
+          time: toSec(last.time),
+          open: last.open,
+          high: last.high,
+          low: last.low,
+          close: last.close,
+        });
+        volumeSeriesRef.current?.update({
+          time: toSec(last.time),
+          value: last.volume,
+          color: last.close >= last.open ? TV_UP_ALPHA : TV_DOWN_ALPHA,
+        });
       } else {
-        const roundedTime = Math.floor(tradeTime / 60_000) * 60_000;
-        updated.push({
+        // New bucket → add new candle
+        const roundedTime = Math.floor(timestamp / 60_000) * 60_000;
+        const newCandle: Candle = {
           time: roundedTime,
-          open: Number(tradePrice.toFixed(2)),
-          high: Number(tradePrice.toFixed(2)),
-          low: Number(tradePrice.toFixed(2)),
-          close: Number(tradePrice.toFixed(2)),
-          volume: tradeQty,
+          open: price,
+          high: price,
+          low: price,
+          close: price,
+          volume: quantity,
+        };
+        updated.push(newCandle);
+
+        candleSeriesRef.current?.update({
+          time: toSec(roundedTime),
+          open: price,
+          high: price,
+          low: price,
+          close: price,
+        });
+        volumeSeriesRef.current?.update({
+          time: toSec(roundedTime),
+          value: quantity,
+          color: TV_UP_ALPHA,
         });
       }
 
-      return updated.slice(-120); // Keep up to 120 candles visible
+      return updated.slice(-300);
     });
   }, [trades]);
 
-  // ── SVG layout constants ──────────────────────────────────────────────────
-  const svgWidth = 650;
-  const svgHeight = 240;
-  const chartHeight = svgHeight * 0.75;
-  const volumeHeight = svgHeight * 0.20;
-
-  // ── Price & volume scales ─────────────────────────────────────────────────
-  const prices = useMemo(() => candles.flatMap((c) => [c.high, c.low]), [candles]);
-  const minPrice = useMemo(() => (prices.length ? Math.min(...prices) * 0.999 : 0), [prices]);
-  const priceRange = useMemo(() => {
-    const maxP = prices.length ? Math.max(...prices) * 1.001 : 1;
-    return maxP - minPrice || 1;
-  }, [prices, minPrice]);
-  const maxVolume = useMemo(() => Math.max(...candles.map((c) => c.volume), 1), [candles]);
-
-  // ── Hover state ───────────────────────────────────────────────────────────
-  const [hoveredCandle, setHoveredCandle] = useState<Candle | null>(null);
-  const [hoverX, setHoverX] = useState<number | null>(null);
-  const [hoverY, setHoverY] = useState<number | null>(null);
-  const chartRef = useRef<SVGSVGElement | null>(null);
-
-  const handleMouseMove = (e: React.MouseEvent<SVGSVGElement>) => {
-    if (!chartRef.current || candles.length === 0) return;
-    const rect = chartRef.current.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
-    const scaleX = svgWidth / candles.length;
-    const index = Math.floor((x / rect.width) * candles.length);
-    if (index >= 0 && index < candles.length) {
-      setHoveredCandle(candles[index]);
-      setHoverX((index + 0.5) * scaleX);
-      setHoverY((y / rect.height) * svgHeight);
-    }
-  };
-
-  const handleMouseLeave = () => {
-    setHoveredCandle(null);
-    setHoverX(null);
-    setHoverY(null);
-  };
-
-  // ── Rendered candles ──────────────────────────────────────────────────────
-  const renderedCandles = useMemo(() => {
-    const candleWidthFactor = 0.65;
-    const stepX = svgWidth / Math.max(candles.length, 1);
-
-    return candles.map((c, idx) => {
-      const isGreen = c.close >= c.open;
-      const x = idx * stepX + stepX / 2;
-
-      const topY = chartHeight - ((Math.max(c.open, c.close) - minPrice) / priceRange) * chartHeight;
-      const bottomY = chartHeight - ((Math.min(c.open, c.close) - minPrice) / priceRange) * chartHeight;
-      const highY = chartHeight - ((c.high - minPrice) / priceRange) * chartHeight;
-      const lowY = chartHeight - ((c.low - minPrice) / priceRange) * chartHeight;
-
-      const rectHeight = Math.max(bottomY - topY, 1.5);
-      const rectWidth = stepX * candleWidthFactor;
-
-      const volBarHeight = (c.volume / maxVolume) * volumeHeight;
-      const volY = svgHeight - volBarHeight;
-
-      return { x, topY, rectHeight, rectWidth, highY, lowY, isGreen, volY, volBarHeight };
-    });
-  }, [candles, minPrice, priceRange, maxVolume, chartHeight, svgHeight, volumeHeight]);
-
+  /* ── Derived header values ──────────────────────────────────────────────── */
   const displayCandle = hoveredCandle ?? candles[candles.length - 1];
-
-  // ── Price change indicator vs. previous close ─────────────────────────────
   const prevClose = meta?.previousClose;
   const lastClose = candles[candles.length - 1]?.close;
   const pctChange =
@@ -177,54 +310,88 @@ export default function Chart() {
       : null;
   const isPositive = pctChange !== null ? parseFloat(pctChange) >= 0 : true;
 
+  /* ─────────────────────────────────────────────────────────────────────── */
   return (
     <div className="glass-panel rounded-2xl flex flex-col h-full overflow-hidden shadow-xl">
-      {/* Header */}
-      <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between px-5 py-3.5 border-b border-white/5 bg-slate-950/20 gap-3">
+      {/* ── Header ──────────────────────────────────────────────────────── */}
+      <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between px-5 py-3 border-b border-white/5 bg-slate-950/20 gap-2 flex-shrink-0">
+        {/* Left: symbol + price badge */}
         <div className="flex items-center gap-3 min-w-0">
           <TrendingUp className="w-4 h-4 text-emerald-400 flex-shrink-0" />
-          <div className="flex flex-col min-w-0">
-            <span className="text-xs font-mono font-semibold text-slate-200 tracking-wider uppercase truncate">
+          <div className="flex flex-col min-w-0 leading-tight">
+            <span className="text-xs font-mono font-semibold text-slate-200 tracking-wider uppercase">
               {activeSymbol} / {meta?.currency ?? "USD"}
             </span>
-            <span className="text-[9px] font-mono text-slate-500 truncate">
-              {meta?.exchangeName ?? "Exchange"} · {meta?.marketState ?? "Loading"}
+            <span className="text-[9px] font-mono text-slate-500">
+              {meta?.exchangeName ?? "—"} · {meta?.marketState ?? "Loading"}
             </span>
           </div>
 
-          {/* Live price badge */}
           {lastClose && (
-            <div className="flex items-center gap-2 ml-3">
-              <span className={`text-sm font-bold font-mono tabular-nums ${isPositive ? "text-emerald-400 glow-text-green" : "text-red-400 glow-text-red"}`}>
-                ${lastClose.toFixed(2)}
+            <div className="flex items-center gap-2 ml-2">
+              <span
+                className={`text-sm font-bold font-mono tabular-nums ${
+                  isPositive ? "text-emerald-400" : "text-red-400"
+                }`}
+              >
+                ${lastClose.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
               </span>
               {pctChange && (
-                <span className={`text-[10px] font-mono px-1.5 py-0.5 rounded font-semibold ${
-                  isPositive
-                    ? "bg-emerald-500/10 text-emerald-400 border border-emerald-500/20"
-                    : "bg-red-500/10 text-red-400 border border-red-500/20"
-                }`}>
-                  {isPositive ? "+" : ""}{pctChange}%
+                <span
+                  className={`text-[10px] font-mono px-1.5 py-0.5 rounded font-semibold ${
+                    isPositive
+                      ? "bg-emerald-500/10 text-emerald-400 border border-emerald-500/20"
+                      : "bg-red-500/10 text-red-400 border border-red-500/20"
+                  }`}
+                >
+                  {isPositive ? "+" : ""}
+                  {pctChange}%
                 </span>
               )}
             </div>
           )}
         </div>
 
-        {/* OHLCV info from hovered or latest candle */}
+        {/* Right: OHLCV tooltip + refresh */}
         <div className="flex flex-wrap items-center gap-3 font-mono text-[10px] text-slate-400">
           {displayCandle && !loading && (
             <>
-              <span>O: <span className={displayCandle.close >= displayCandle.open ? "text-emerald-400" : "text-red-400"}>${displayCandle.open.toFixed(2)}</span></span>
-              <span>H: <span className="text-slate-200">${displayCandle.high.toFixed(2)}</span></span>
-              <span>L: <span className="text-slate-200">${displayCandle.low.toFixed(2)}</span></span>
-              <span>C: <span className={displayCandle.close >= displayCandle.open ? "text-emerald-400" : "text-red-400"}>${displayCandle.close.toFixed(2)}</span></span>
-              <span className="hidden sm:inline">V: <span className="text-blue-400">{displayCandle.volume.toLocaleString()}</span></span>
+              <span>
+                O:{" "}
+                <span
+                  className={
+                    displayCandle.close >= displayCandle.open
+                      ? "text-emerald-400"
+                      : "text-red-400"
+                  }
+                >
+                  ${displayCandle.open.toFixed(2)}
+                </span>
+              </span>
+              <span>
+                H: <span className="text-slate-200">${displayCandle.high.toFixed(2)}</span>
+              </span>
+              <span>
+                L: <span className="text-slate-200">${displayCandle.low.toFixed(2)}</span>
+              </span>
+              <span>
+                C:{" "}
+                <span
+                  className={
+                    displayCandle.close >= displayCandle.open
+                      ? "text-emerald-400"
+                      : "text-red-400"
+                  }
+                >
+                  ${displayCandle.close.toFixed(2)}
+                </span>
+              </span>
             </>
           )}
           <button
+            id="chart-refresh-btn"
             onClick={() => fetchCandles(activeSymbol)}
-            title="Refresh"
+            title="Refresh chart"
             className="ml-1 text-slate-500 hover:text-slate-300 transition-colors"
           >
             <RefreshCw className="w-3 h-3" />
@@ -232,17 +399,24 @@ export default function Chart() {
         </div>
       </div>
 
-      {/* Chart Body */}
-      <div className="flex-1 w-full bg-slate-950/25 relative select-none">
+      {/* ── Chart body ──────────────────────────────────────────────────── */}
+      <div className="flex-1 relative min-h-0">
+        {/* lightweight-charts mount point */}
+        <div ref={containerRef} className="absolute inset-0" />
+
+        {/* Loading overlay */}
         {loading && (
-          <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 text-xs font-mono text-slate-500">
+          <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-slate-950/60 backdrop-blur-sm z-10">
             <div className="w-5 h-5 border-2 border-slate-600 border-t-blue-400 rounded-full animate-spin" />
-            <span>Loading {activeSymbol} data from Yahoo Finance…</span>
+            <span className="text-[11px] font-mono text-slate-400">
+              Loading {activeSymbol} · Yahoo Finance
+            </span>
           </div>
         )}
 
+        {/* Error overlay */}
         {!loading && error && (
-          <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 px-6 text-center">
+          <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-slate-950/70 backdrop-blur-sm z-10 px-6 text-center">
             <span className="text-xs font-mono text-red-400">{error}</span>
             <button
               onClick={() => fetchCandles(activeSymbol)}
@@ -253,45 +427,13 @@ export default function Chart() {
           </div>
         )}
 
+        {/* Empty state */}
         {!loading && !error && candles.length === 0 && (
-          <div className="absolute inset-0 flex items-center justify-center text-xs font-mono text-slate-500">
-            No candle data returned for {activeSymbol}. Market may be closed.
+          <div className="absolute inset-0 flex items-center justify-center z-10">
+            <span className="text-xs font-mono text-slate-500">
+              No data for {activeSymbol} — market may be closed.
+            </span>
           </div>
-        )}
-
-        {!loading && !error && candles.length > 0 && (
-          <svg
-            ref={chartRef}
-            className="w-full h-full p-2 overflow-visible cursor-crosshair"
-            viewBox={`0 0 ${svgWidth} ${svgHeight}`}
-            onMouseMove={handleMouseMove}
-            onMouseLeave={handleMouseLeave}
-          >
-            {/* Grid lines */}
-            <line x1={0} y1={chartHeight / 4} x2={svgWidth} y2={chartHeight / 4} stroke="rgba(255,255,255,0.025)" strokeWidth="0.8" strokeDasharray="3,3" />
-            <line x1={0} y1={chartHeight / 2} x2={svgWidth} y2={chartHeight / 2} stroke="rgba(255,255,255,0.03)" strokeWidth="0.8" strokeDasharray="3,3" />
-            <line x1={0} y1={(chartHeight * 3) / 4} x2={svgWidth} y2={(chartHeight * 3) / 4} stroke="rgba(255,255,255,0.025)" strokeWidth="0.8" strokeDasharray="3,3" />
-            <line x1={0} y1={chartHeight} x2={svgWidth} y2={chartHeight} stroke="rgba(255,255,255,0.06)" strokeWidth="1" />
-            <line x1={0} y1={svgHeight - volumeHeight} x2={svgWidth} y2={svgHeight - volumeHeight} stroke="rgba(255,255,255,0.02)" strokeWidth="0.8" />
-
-            {/* Candles + Volume */}
-            {renderedCandles.map((c, i) => (
-              <g key={i}>
-                <line x1={c.x} y1={c.highY} x2={c.x} y2={c.lowY} stroke={c.isGreen ? "#34d399" : "#f87171"} strokeWidth="1.2" />
-                <rect x={c.x - c.rectWidth / 2} y={c.topY} width={c.rectWidth} height={c.rectHeight} fill={c.isGreen ? "#10b981" : "#ef4444"} rx="1" />
-                <rect x={c.x - c.rectWidth / 2} y={c.volY} width={c.rectWidth} height={c.volBarHeight} fill={c.isGreen ? "rgba(16,185,129,0.2)" : "rgba(239,68,68,0.2)"} rx="0.5" />
-              </g>
-            ))}
-
-            {/* Crosshair */}
-            {hoverX !== null && hoverY !== null && (
-              <g>
-                <line x1={hoverX} y1={0} x2={hoverX} y2={svgHeight} stroke="rgba(59,130,246,0.35)" strokeWidth="0.8" strokeDasharray="4,4" />
-                <line x1={0} y1={hoverY} x2={svgWidth} y2={hoverY} stroke="rgba(59,130,246,0.35)" strokeWidth="0.8" strokeDasharray="4,4" />
-                <circle cx={hoverX} cy={hoverY} r="3" fill="#60a5fa" />
-              </g>
-            )}
-          </svg>
         )}
       </div>
     </div>
